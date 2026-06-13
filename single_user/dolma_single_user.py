@@ -204,9 +204,13 @@ def add_office(name):
     finally:
         conn.close()
 
-def get_offices():
+def get_offices(search_query=None):
     conn = get_db_connection()
-    df = pd.read_sql_query("SELECT * FROM offices ORDER BY name", conn)
+    if search_query:
+        query = "SELECT * FROM offices WHERE name LIKE ? ORDER BY name"
+        df = pd.read_sql_query(query, conn, params=(f"%{search_query}%",))
+    else:
+        df = pd.read_sql_query("SELECT * FROM offices ORDER BY name", conn)
     conn.close()
     return df
 
@@ -324,7 +328,7 @@ def _send_email(token, to_list, cc_list, subject, body, aids, base_url):
     xml = f'''<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Header><context xmlns="urn:zimbra"><authToken>{token}</authToken></context></soap:Header>
   <soap:Body><SendMsgRequest xmlns="urn:zimbraMail"><m>{to_xml}{cc_xml}<su>{safe(subject)}</su>{att_xml}<mp ct="text/plain"><content>{safe(body)}</content></mp></m></SendMsgRequest></soap:Body></soap:Envelope>'''
-    
+   
     res = _create_session().post(f"{base_url}/service/soap", data=xml, headers={"Content-Type": "text/xml; charset=utf-8"}, timeout=(30, 180))
     res.raise_for_status()
     if "soap:Fault" in res.text:
@@ -334,13 +338,13 @@ def _send_email(token, to_list, cc_list, subject, body, aids, base_url):
 def send_email_workflow(to_list, cc_list, files, subject, body):
     """Generator yielding progress updates for st.status."""
     if not ZIMBRA_EMAIL or not ZIMBRA_PASSWORD: raise ValueError("ZIMBRA credentials missing.")
-    
+   
     yield "🔐 Validating Zimbra session...", 10
     time.sleep(0.4)
     token = _get_valid_token()
     yield "✅ Session ready", 20
     time.sleep(0.3)
-    
+   
     try:
         aids = []
         if files:
@@ -349,7 +353,7 @@ def send_email_workflow(to_list, cc_list, files, subject, body):
             aids = _upload_files(token, files, ZIMBRA_BASE_URL)
             yield "✅ Attachments uploaded", 70
             time.sleep(0.3)
-        
+       
         yield "📨 Sending email...", 85
         time.sleep(0.3)
         _send_email(token, to_list, cc_list, subject, body, aids, ZIMBRA_BASE_URL)
@@ -379,7 +383,24 @@ def page_office_management():
     st.markdown("<h1 class='premium-title'>🏢 Office Management</h1>", unsafe_allow_html=True)
     st.markdown("Manage offices and their associated email addresses here.")
     
-    offices_df = get_offices()
+    # --- Search Bar ---
+    search_col1, search_col2 = st.columns([3, 1])
+    with search_col1:
+        search_query = st.text_input(
+            "🔍 Search Offices", 
+            placeholder="Search by office name...",
+            key="office_search",
+            help="Type to filter offices by name"
+        )
+    with search_col2:
+        if st.button("🔄 Clear", use_container_width=True, key="clear_search"):
+            st.session_state.office_search = ""
+            st.rerun()
+    
+    offices_df = get_offices(search_query if search_query else None)
+    
+    if search_query:
+        st.caption(f"Showing {len(offices_df)} office(s) matching '{search_query}'")
     
     col1, col2 = st.columns([1, 1])
     
@@ -406,7 +427,7 @@ def page_office_management():
         else:
             with st.form("add_email_form", clear_on_submit=True):
                 office_dict = dict(zip(offices_df.name, offices_df.id))
-                selected_office_name = st.selectbox("Select Office", placeholder= "Select Office" ,index=None,options=list(office_dict.keys()))
+                selected_office_name = st.selectbox("Select Office", placeholder="Select Office", index=None, options=list(office_dict.keys()))
                 new_email = st.text_input("Email Address", placeholder="contact@branch.com")
                 submitted = st.form_submit_button("➕ Add Email", use_container_width=True)
                 
@@ -428,7 +449,10 @@ def page_office_management():
     st.subheader("Manage Existing Offices & Emails")
     
     if offices_df.empty:
-        st.write("No offices available.")
+        if search_query:
+            st.info(f"No offices found matching '{search_query}'. Try a different search or clear the filter.")
+        else:
+            st.write("No offices available.")
         return
 
     all_emails_df = get_office_emails()
@@ -454,7 +478,7 @@ def page_office_management():
 
 def page_send_email():
     st.markdown("<h1 class='premium-title'>📤 Send Email</h1>", unsafe_allow_html=True)
-    st.markdown("Compose and send an email.")
+    st.markdown("Compose and send an email with selective recipient control.")
     
     offices_df = get_offices()
     if offices_df.empty:
@@ -464,28 +488,60 @@ def page_send_email():
     office_dict = dict(zip(offices_df.name, offices_df.id))
     
     # Form fields
-    selected_office_name = st.selectbox("🏛️ Select Office", placeholder = "Select Office", index=None, options=list(office_dict.keys()))
+    selected_office_name = st.selectbox(
+        "🏛️ Select Office", 
+        placeholder="Select Office", 
+        index=None, 
+        options=list(office_dict.keys()),
+        help="Choose an office to auto-populate its email addresses"
+    )
     
-    # Dynamic email selection
+    # Dynamic email selection with selective control
     selected_emails = []
     if selected_office_name:
         office_id = office_dict[selected_office_name]
         emails_df = get_office_emails(office_id)
         if emails_df.empty:
-            st.info("⚠️ This office has no saved email addresses. You can still manually type one below, or add it in Office Management.")
+            st.info("⚠️ This office has no saved email addresses. You can add them in Office Management, or manually type recipients below.")
         else:
             available_emails = emails_df['email'].tolist()
-            selected_emails = st.multiselect("Receivers (Auto-populated from Office)", options=available_emails, default=available_emails)
+            
+            # Display available emails as chips for visual reference
+            st.markdown("**📧 Available emails for this office:**")
+            email_chips_html = " ".join([f"<span class='email-chip'>{e}</span>" for e in available_emails])
+            st.markdown(f"<div style='margin-bottom: 10px;'>{email_chips_html}</div>", unsafe_allow_html=True)
+            
+            # Multiselect for selective recipient choice
+            selected_emails = st.multiselect(
+                "✅ Select Recipients (choose one or more)", 
+                options=available_emails, 
+                default=available_emails,
+                help="Uncheck emails you don't want to send to. All are selected by default."
+            )
             if selected_emails:
-                 st.markdown(f"<div style='margin-top:-15px; margin-bottom:10px;'><span style='color:#10b981; font-size:0.9rem;'>✅ Will send to {len(selected_emails)} selected email(s)</span></div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='margin-top:-5px; margin-bottom:10px;'><span style='color:#10b981; font-size:0.9rem;'>✅ Will send to {len(selected_emails)} of {len(available_emails)} email(s)</span></div>", unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ No recipients selected. Please select at least one email.")
     
-    manual_to = st.text_input("➕ Additional Receivers (Optional, comma-separated)", placeholder="other@domain.com")
+    manual_to = st.text_input(
+        "➕ Additional Receivers (Optional, comma-separated)", 
+        placeholder="other@domain.com",
+        help="Add extra recipients not in the office's email list"
+    )
     
-    cc_input = st.text_input("📧 CC (Optional, comma-separated)", placeholder="manager@domain.com, hr@domain.com")
+    cc_input = st.text_input(
+        "📧 CC (Optional, comma-separated)", 
+        placeholder="manager@domain.com, hr@domain.com"
+    )
     subject = st.text_input("🔖 Subject", placeholder="Email Subject")
     body = st.text_area("📝 Body", height=150, placeholder="Type your message here...")
     
-    files = st.file_uploader("📎 Upload Attachments", type=ALLOWED_EXTENSIONS, accept_multiple_files=True, help="Max 10MB/file, 25MB total")
+    files = st.file_uploader(
+        "📎 Upload Attachments", 
+        type=ALLOWED_EXTENSIONS, 
+        accept_multiple_files=True, 
+        help="Max 10MB/file, 25MB total"
+    )
     
     if st.button("🚀 Send Email", type="primary", use_container_width=True):
         # Gather all TO emails
@@ -512,12 +568,12 @@ def page_send_email():
 
         # Validation
         if not final_to_list:
-            st.error("Please provide at least one receiver.")
+            st.error("Please provide at least one receiver (select from office emails or add manually).")
             return
         if not subject.strip():
             st.error("Subject is required.")
             return
-            
+           
         # File Validation
         total_size = 0
         if files:
@@ -536,7 +592,7 @@ def page_send_email():
                 for msg, val in send_email_workflow(final_to_list, final_cc_list, files, subject, body):
                     status.update(label=msg, state="running")
                     st.progress(val)
-                
+               
                 # Log success
                 office_id = office_dict[selected_office_name] if selected_office_name else None
                 log_email(
@@ -546,7 +602,7 @@ def page_send_email():
                     cc=", ".join(final_cc_list) if final_cc_list else "",
                     subject=subject
                 )
-                
+               
                 st.success("✅ Email sent successfully!")
                 st.balloons()
             except Exception as e:
@@ -560,81 +616,67 @@ def page_logs_analytics():
     if logs_df.empty:
         st.info("No emails have been sent yet.")
         return
-        
-    logs_df['created_at'] = pd.to_datetime(logs_df['created_at'])
     
-    # Metrics
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Emails Sent", len(logs_df))
-    unique_offices = logs_df['office_name'].nunique(dropna=True)
-    c2.metric("Offices Mailed", unique_offices)
-    c3.metric("Last Sent", logs_df['created_at'].max().strftime("%Y-%m-%d %H:%M"))
+    # Search/Filter logs
+    search_col1, search_col2 = st.columns([3, 1])
+    with search_col1:
+        log_search = st.text_input(
+            "🔍 Search Logs", 
+            placeholder="Search by subject, office, recipients...",
+            key="log_search"
+        )
+    with search_col2:
+        office_filter = st.selectbox(
+            "Filter by Office",
+            options=["All"] + sorted(logs_df['office_name'].dropna().unique().tolist()),
+            key="log_office_filter"
+        )
     
-    st.divider()
-    
-    # Filters
-    st.subheader("🔍 Filter Logs")
-    f_col1, f_col2, f_col3 = st.columns(3)
-    
-    offices = ["All"] + sorted(logs_df['office_name'].dropna().unique().tolist())
-    selected_office = f_col1.selectbox("Filter by Office", offices)
-    
-    search_subj = f_col2.text_input("Search Subject")
-    date_range = f_col3.date_input("Date Range", [])
-
     filtered_df = logs_df.copy()
-    if selected_office != "All":
-        filtered_df = filtered_df[filtered_df['office_name'] == selected_office]
-    if search_subj.strip():
-        filtered_df = filtered_df[filtered_df['subject'].str.contains(search_subj, case=False, na=False)]
-    if len(date_range) == 2:
-        start_date = pd.Timestamp(date_range[0])
-        end_date = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-        filtered_df = filtered_df[(filtered_df['created_at'] >= start_date) & (filtered_df['created_at'] <= end_date)]
-
-    # Display Logs
-    st.subheader("📋 Sent Emails")
-    display_df = filtered_df.copy()
-    display_df['created_at'] = display_df['created_at'].dt.strftime("%Y-%m-%d %H:%M:%S")
-    st.dataframe(display_df.drop(columns=['id']), use_container_width=True, hide_index=True)
+    if log_search:
+        mask = filtered_df.astype(str).apply(lambda col: col.str.contains(log_search, case=False, na=False)).any(axis=1)
+        filtered_df = filtered_df[mask]
+    if office_filter != "All":
+        filtered_df = filtered_df[filtered_df['office_name'] == office_filter]
     
-    # Download
-    csv = display_df.to_csv(index=False)
-    st.download_button(
-        label="⬇️ Download Logs as CSV",
-        data=csv,
-        file_name=f"email_logs_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
+    st.caption(f"Showing {len(filtered_df)} of {len(logs_df)} logs")
+    
+    # Display logs
+    for _, row in filtered_df.iterrows():
+        with st.expander(f"📧 {row['subject']} — {row['created_at']}"):
+            st.markdown(f"**Office:** {row['office_name'] or 'N/A'}")
+            st.markdown(f"**From:** {row['sender']}")
+            st.markdown(f"**To:** {row['receivers']}")
+            if row['cc']:
+                st.markdown(f"**CC:** {row['cc']}")
+            st.markdown(f"**Date:** {row['created_at']}")
 
-# ==========================================
-# MAIN APP ENTRY POINT
-# ==========================================
 def main():
-    st.set_page_config(page_title="Email Sender App", page_icon="📧", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title="DOLMA Email Sender", 
+        page_icon="📧", 
+        layout="wide", 
+        initial_sidebar_state="expanded"
+    )
+    
     init_db()
     
     with st.sidebar:
-        st.markdown("<h2 class='premium-title' style='font-size: 1.5rem; margin-bottom: 0.5rem;'>📧 Navigation</h2>", unsafe_allow_html=True)
-        st.markdown("Select a page below:")
-        page = st.radio("Go to", ["Office Management", "Send Email", "Logs & Analytics"])
-        
-        # Display currently used sender email
-        st.markdown(f"""
-        <div class="sender-card">
-            <div class="sender-label">Active Sender</div>
-            <div class="sender-value">{ZIMBRA_EMAIL if ZIMBRA_EMAIL else "Not Configured"}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
+        st.title("📂 Navigation")
+        menu = st.radio(
+            "Go To", 
+            ["📤 Send Email", "🏢 Office Management", "📊 Logs & Analytics"], 
+            index=0
+        )
         st.divider()
-        st.caption(f"App initialized. Local DB: `{DB_NAME}`")
-        
-    if page == "Office Management":
-        page_office_management()
-    elif page == "Send Email":
+        st.info("📧 **Configure Zimbra credentials in .env**")
+        st.caption("ZIMBRA_EMAIL & ZIMBRA_PASSWORD")
+    
+    if menu == "📤 Send Email":
         page_send_email()
-    elif page == "Logs & Analytics":
+    elif menu == "🏢 Office Management":
+        page_office_management()
+    elif menu == "📊 Logs & Analytics":
         page_logs_analytics()
 
 if __name__ == "__main__":
